@@ -27,6 +27,7 @@ import (
 	"github.com/attestantio/dirk/services/ruler"
 	"github.com/attestantio/dirk/services/ruler/golang"
 	localunlocker "github.com/attestantio/dirk/services/unlocker/local"
+	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	keystorev4 "github.com/wealdtech/go-eth2-wallet-encryptor-keystorev4"
@@ -130,7 +131,6 @@ func TestFetchAccount(t *testing.T) {
 
 	tests := []struct {
 		name        string
-		credentials *checker.Credentials
 		accountName string
 		pubKey      []byte
 		res         core.Result
@@ -163,7 +163,7 @@ func TestFetchAccount(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_, _, res := signerSvc.fetchAccount(context.Background(), test.credentials, test.accountName, test.pubKey)
+			_, _, res := signerSvc.fetchAccount(context.Background(), test.accountName, test.pubKey)
 			assert.Equal(t, test.res, res)
 		})
 	}
@@ -282,7 +282,7 @@ func setupSignerService(ctx context.Context) (*Service, e2wtypes.Wallet, []e2wty
 		return nil, nil, nil, err
 	}
 
-	checkerSvc, err := mockchecker.New()
+	checkerSvc, err := mockchecker.New(zerolog.Disabled)
 	if err != nil {
 		return nil, nil, nil, err
 	}

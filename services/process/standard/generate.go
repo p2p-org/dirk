@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"sync"
 
 	"github.com/attestantio/dirk/core"
 	"github.com/attestantio/dirk/services/checker"
@@ -84,17 +85,17 @@ func (s *Service) OnGenerate(ctx context.Context,
 
 	if numParticipants == 1 {
 		// Only 1 participant means we are generating a standard account.
-		pubKey, err := s.generate(ctx, credentials, wallet, accountName, passphrase)
+		pubKey, err := s.generate(ctx, wallet, accountName, passphrase)
 		if err != nil {
 			log.Error().Err(err).Msg("Failed to generate account")
 			return nil, nil, errors.New("failed account generation")
 		}
 		return pubKey, nil, err
 	}
-	return s.generateDistributed(ctx, credentials, wallet, account, passphrase, signingThreshold, numParticipants)
+	return s.generateDistributed(ctx, wallet, account, passphrase, signingThreshold, numParticipants)
 }
 
-func (s *Service) generate(ctx context.Context, credentials *checker.Credentials, wallet e2wtypes.Wallet, accountName string, passphrase []byte) ([]byte, error) {
+func (s *Service) generate(ctx context.Context, wallet e2wtypes.Wallet, accountName string, passphrase []byte) ([]byte, error) {
 	span, ctx := opentracing.StartSpanFromContext(ctx, "services.process.generate")
 	defer span.Finish()
 
@@ -132,7 +133,7 @@ func (s *Service) generate(ctx context.Context, credentials *checker.Credentials
 	return createdAccount.PublicKey().Marshal(), nil
 }
 
-func (s *Service) generateDistributed(ctx context.Context, credentials *checker.Credentials, wallet e2wtypes.Wallet, account string, passphrase []byte, signingThreshold uint32, numParticipants uint32) ([]byte, []*core.Endpoint, error) {
+func (s *Service) generateDistributed(ctx context.Context, wallet e2wtypes.Wallet, account string, passphrase []byte, signingThreshold uint32, numParticipants uint32) ([]byte, []*core.Endpoint, error) {
 	span, ctx := opentracing.StartSpanFromContext(ctx, "services.process.generateDistributed")
 	defer span.Finish()
 
@@ -177,19 +178,41 @@ func (s *Service) generateDistributed(ctx context.Context, credentials *checker.
 		return nil, nil, errors.New("failed to generate enough commit data")
 	}
 	confirmationSigs := make([][]byte, len(participants))
-	for i, participant := range participants {
-		log.Trace().Str("endpoint", participant.String()).Msg("Sending commit request to endpoint")
-		pubKeys[i], confirmationSigs[i], err = s.senderSvc.Commit(ctx, participant, account, confirmationData)
+
+	type result struct {
+		PubKey          []byte
+		ConfirmationSig []byte
+		Err             error
+	}
+
+	ch := make(chan result)
+	var wg sync.WaitGroup
+	results := make([]result, len(participants))
+
+	for _, participant := range participants {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			log.Trace().Str("endpoint", participant.String()).Msg("Sending commit request to endpoint")
+			pubKey, confirmationSig, err := s.senderSvc.Commit(ctx, participant, account, confirmationData)
+			ch <- result{PubKey: pubKey, ConfirmationSig: confirmationSig, Err: err}
+		}()
+	}
+
+	wg.Wait()
+
+	for i, result := range results {
+		pubKeys[i], confirmationSigs[i], err = result.PubKey, result.ConfirmationSig, result.Err
 		if err != nil {
-			log.Error().Err(err).Str("endpoint", participant.String()).Msg("Failed to commit on endpoint")
+			log.Error().Err(err).Str("endpoint", participants[i].String()).Msg("Failed to commit on endpoint")
 			return nil, nil, errors.Wrap(err, "failed to complete generation")
 		}
-		if len(pubKeys[i]) == 0 {
-			log.Error().Uint64("participant", participant.ID).Msg("Received empty public key from participant on commit")
+		if len(result.PubKey) == 0 {
+			log.Error().Uint64("participant", participants[i].ID).Msg("Received empty public key from participant on commit")
 			return nil, nil, errors.New("failed to complete generation")
 		}
-		if len(confirmationSigs[i]) == 0 {
-			log.Error().Uint64("participant", participant.ID).Msg("Received empty confirmation signature from participant on commit")
+		if len(result.ConfirmationSig) == 0 {
+			log.Error().Uint64("participant", participants[i].ID).Msg("Received empty confirmation signature from participant on commit")
 			return nil, nil, errors.New("failed to complete generation")
 		}
 	}

@@ -1,4 +1,4 @@
-// Copyright © 2020, 2021 Attestant Limited.
+// Copyright © 2020 - 2022 Attestant Limited.
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,7 +16,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"net/http"
 	"time"
 
@@ -58,17 +57,16 @@ import (
 	localunlocker "github.com/attestantio/dirk/services/unlocker/local"
 	standardwalletmanager "github.com/attestantio/dirk/services/walletmanager/standard"
 	"github.com/attestantio/dirk/util"
-	"github.com/attestantio/dirk/util/loggers"
+	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/mitchellh/go-homedir"
-	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	zerologger "github.com/rs/zerolog/log"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
-	jaegerconfig "github.com/uber/jaeger-client-go/config"
 	e2types "github.com/wealdtech/go-eth2-types/v2"
 	e2wtypes "github.com/wealdtech/go-eth2-wallet-types/v2"
 	majordomo "github.com/wealdtech/go-majordomo"
+	asmconfidant "github.com/wealdtech/go-majordomo/confidants/asm"
 	directconfidant "github.com/wealdtech/go-majordomo/confidants/direct"
 	fileconfidant "github.com/wealdtech/go-majordomo/confidants/file"
 	gsmconfidant "github.com/wealdtech/go-majordomo/confidants/gsm"
@@ -76,7 +74,7 @@ import (
 )
 
 // ReleaseVersion is the release version for the code.
-var ReleaseVersion = "1.1.0"
+var ReleaseVersion = "1.1.1"
 
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -91,7 +89,10 @@ func main() {
 	}
 
 	// runCommands will not return if a command is run.
-	runCommands(ctx, majordomo)
+	exit, exitCode := runCommands(ctx, majordomo)
+	if exit {
+		os.Exit(exitCode)
+	}
 
 	if err := initLogging(); err != nil {
 		log.Fatal().Err(err).Msg("Failed to initialise logging")
@@ -108,13 +109,9 @@ func main() {
 		log.Fatal().Err(err).Msg("Failed to initialise profiling")
 	}
 
-	closer, err := initTracing()
-	if err != nil {
+	if err := initTracing(ctx, majordomo); err != nil {
 		log.Error().Err(err).Msg("Failed to initialise tracing")
 		return
-	}
-	if closer != nil {
-		defer closer.Close()
 	}
 
 	runtime.GOMAXPROCS(runtime.NumCPU() * 8)
@@ -205,8 +202,26 @@ func fetchConfig() error {
 	viper.SetDefault("storage-path", "storage")
 
 	if err := viper.ReadInConfig(); err != nil {
-		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
-			return errors.Wrap(err, "failed to read configuration file")
+		switch {
+		case errors.Is(err, viper.ConfigFileNotFoundError{}):
+			// It is allowable for Dirk to not have a configuration file, but only if
+			// we have the information from elsewhere (e.g. environment variables).  Check
+			// to see if we have a server name configured, as if not we aren't going to
+			// get very far anyway.
+			if viper.GetString("server.name") == "" {
+				// Assume the underlying issue is that the configuration file is missing.
+				return errors.Wrap(err, "could not find the configuration file")
+			}
+		case errors.Is(err, viper.ConfigParseError{}):
+			return errors.Wrap(err, "could not parse the configuration file")
+		case errors.Is(err, viper.RemoteConfigError("")):
+			return errors.Wrap(err, "could not find the remote configuration file")
+		case errors.Is(err, viper.UnsupportedConfigError("")):
+			return errors.Wrap(err, "unsupported configuration file format")
+		case errors.Is(err, viper.UnsupportedRemoteProviderError("")):
+			return errors.Wrap(err, "unsupported remote configuration provider")
+		default:
+			return err
 		}
 	}
 
@@ -214,61 +229,38 @@ func fetchConfig() error {
 }
 
 // initProfiling initialises the profiling server.
+//nolint:unparam
 func initProfiling() error {
 	profileAddress := viper.GetString("profile-address")
 	if profileAddress != "" {
-		runtime.SetMutexProfileFraction(1)
-		runtime.SetBlockProfileRate(1)
-		log.Info().Str("profileAddress", profileAddress).Msg("Starting profile server")
 		go func() {
-			if err := http.ListenAndServe(profileAddress, nil); err != nil {
-				log.Error().Str("profileAddress", profileAddress).Err(err).Msg("Failed to start profile server")
+			log.Info().Str("profile_address", profileAddress).Msg("Starting profile server")
+			server := &http.Server{
+				Addr:              profileAddress,
+				ReadHeaderTimeout: 5 * time.Second,
+			}
+			runtime.SetMutexProfileFraction(1)
+			if err := server.ListenAndServe(); err != nil {
+				log.Warn().Str("profile_address", profileAddress).Err(err).Msg("Failed to run profile server")
 			}
 		}()
 	}
 	return nil
 }
 
-// initTracing initialises the tracing.
-func initTracing() (io.Closer, error) {
-	tracingAddress := viper.GetString("tracing-address")
-	if tracingAddress == "" {
-		return nil, nil
-	}
-	cfg := &jaegerconfig.Configuration{
-		ServiceName: "dirk",
-		Sampler: &jaegerconfig.SamplerConfig{
-			Type:  "const",
-			Param: 1,
-		},
-		Reporter: &jaegerconfig.ReporterConfig{
-			LogSpans:           true,
-			LocalAgentHostPort: tracingAddress,
-		},
-	}
-	tracer, closer, err := cfg.NewTracer(jaegerconfig.Logger(loggers.NewJaegerLogger(log)))
-	if err != nil {
-		return nil, err
-	}
-	if tracer != nil {
-		opentracing.SetGlobalTracer(tracer)
-	}
-
-	return closer, nil
-}
-
-func runCommands(ctx context.Context, majordomo majordomo.Service) {
+func runCommands(ctx context.Context, majordomo majordomo.Service) (bool, int) {
 	if viper.GetBool("version") {
 		fmt.Printf("%s\n", ReleaseVersion)
-		os.Exit(0)
+		return true, 0
 	}
 
 	if viper.GetBool("show-certificates") {
 		err := cmd.ShowCertificates(ctx, majordomo)
 		if err != nil {
-			log.Fatal().Err(err).Msg("show-certificates failed")
+			fmt.Fprintf(os.Stderr, "show-certificates failed: %v\n", err)
+			return true, 1
 		}
-		os.Exit(0)
+		return true, 0
 	}
 
 	if viper.GetBool("show-permissions") {
@@ -285,16 +277,19 @@ func runCommands(ctx context.Context, majordomo majordomo.Service) {
 			}
 		}
 		checker.DumpPermissions(permissions)
-		os.Exit(0)
+		return true, 0
 	}
 
 	if viper.GetBool("export-slashing-protection") {
-		exportSlashingProtection(ctx)
+		return true, exportSlashingProtection(ctx)
 	}
 
 	if viper.GetBool("import-slashing-protection") {
-		importSlashingProtection(ctx)
+		return true, importSlashingProtection(ctx)
 	}
+
+	// No command run so no need to exit.
+	return false, 0
 }
 
 func startServices(ctx context.Context, majordomo majordomo.Service, monitor metrics.Service) error {
@@ -367,17 +362,17 @@ func startServices(ctx context.Context, majordomo majordomo.Service, monitor met
 	}
 	certPEMBlock, err := majordomo.Fetch(ctx, viper.GetString("certificates.server-cert"))
 	if err != nil {
-		return errors.Wrap(err, "failed to obtain server certificate")
+		return errors.Wrap(err, fmt.Sprintf("failed to obtain server certificate from %s", viper.GetString("certificates.server-cert")))
 	}
 	keyPEMBlock, err := majordomo.Fetch(ctx, viper.GetString("certificates.server-key"))
 	if err != nil {
-		return errors.Wrap(err, "failed to obtain server key")
+		return errors.Wrap(err, fmt.Sprintf("failed to obtain server key from %s", viper.GetString("certificates.server-key")))
 	}
 	var caPEMBlock []byte
 	if viper.GetString("certificates.ca-cert") != "" {
 		caPEMBlock, err = majordomo.Fetch(ctx, viper.GetString("certificates.ca-cert"))
 		if err != nil {
-			return errors.Wrap(err, "failed to obtain client CA certificate")
+			return errors.Wrap(err, fmt.Sprintf("failed to obtain CA certificate from %s", viper.GetString("certificates.ca-cert")))
 		}
 	}
 	sender, err := sendergrpc.New(ctx,
@@ -523,10 +518,32 @@ func initMajordomo(ctx context.Context) (majordomo.Service, error) {
 		return nil, errors.Wrap(err, "failed to register file confidant")
 	}
 
-	if viper.GetString("majordomo.gsm.credentials") != "" {
+	if viper.GetString("majordomo.asm.region") != "" {
+		var asmCredentials *credentials.Credentials
+		if viper.GetString("majordomo.asm.id") != "" {
+			asmCredentials = credentials.NewStaticCredentials(viper.GetString("majordomo.asm.id"), viper.GetString("majordomo.asm.secret"), "")
+		}
+		asmConfidant, err := asmconfidant.New(ctx,
+			asmconfidant.WithLogLevel(util.LogLevel("majordomo.confidants.asm")),
+			asmconfidant.WithCredentials(asmCredentials),
+			asmconfidant.WithRegion(viper.GetString("majordomo.asm.region")),
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to create AWS secrets manager confidant")
+		}
+		if err := majordomo.RegisterConfidant(ctx, asmConfidant); err != nil {
+			return nil, errors.Wrap(err, "failed to register AWS secrets manager confidant")
+		}
+	}
+
+	if viper.GetString("majordomo.gsm.project") != "" {
+		var gsmCredentialsPath string
+		if viper.GetString("majordomo.gsm.credentials") != "" {
+			gsmCredentialsPath = resolvePath(viper.GetString("majordomo.gsm.credentials"))
+		}
 		gsmConfidant, err := gsmconfidant.New(ctx,
 			gsmconfidant.WithLogLevel(util.LogLevel("majordomo.confidants.gsm")),
-			gsmconfidant.WithCredentialsPath(resolvePath(viper.GetString("majordomo.gsm.credentials"))),
+			gsmconfidant.WithCredentialsPath(gsmCredentialsPath),
 			gsmconfidant.WithProject(viper.GetString("majordomo.gsm.project")),
 		)
 		if err != nil {

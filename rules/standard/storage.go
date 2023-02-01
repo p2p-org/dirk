@@ -43,7 +43,6 @@ func NewStore(base string) (*Store, error) {
 	// Garbage collect in the background on start.
 	go func(db *badger.DB) {
 		for {
-			log.Trace().Msg("Running garbage collection")
 			if err = db.RunValueLogGC(0.7); err != nil {
 				// Error occurs when there is nothing left to collect.
 				break
@@ -97,7 +96,7 @@ func (s *Store) Fetch(ctx context.Context, key []byte) ([]byte, error) {
 	err := s.db.View(func(txn *badger.Txn) error {
 		item, err := txn.Get(key)
 		if err != nil {
-			if err == badger.ErrKeyNotFound {
+			if errors.Is(err, badger.ErrKeyNotFound) {
 				return errors.New("not found")
 			}
 		}

@@ -1,4 +1,4 @@
-// Copyright © 2020 Attestant Limited.
+// Copyright © 2020, 2022 Attestant Limited.
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,8 +16,8 @@ package receiver_test
 import (
 	context "context"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -54,6 +54,11 @@ import (
 )
 
 func TestAbort(t *testing.T) {
+	_, err := net.LookupIP("signer-test01")
+	if err != nil {
+		t.Skip("test signer addresses not configured; skipping test")
+	}
+
 	ctx := context.Background()
 	base, endpoints, _, err := createServers(ctx)
 	require.NoError(t, err)
@@ -71,6 +76,11 @@ func TestAbort(t *testing.T) {
 }
 
 func TestAbortUnknownEndpoint(t *testing.T) {
+	_, err := net.LookupIP("signer-test01")
+	if err != nil {
+		t.Skip("test signer addresses not configured; skipping test")
+	}
+
 	ctx := context.Background()
 	base, endpoints, _, err := createServers(ctx)
 	require.NoError(t, err)
@@ -89,6 +99,11 @@ func TestAbortUnknownEndpoint(t *testing.T) {
 }
 
 func TestEndToEnd(t *testing.T) {
+	_, err := net.LookupIP("signer-test01")
+	if err != nil {
+		t.Skip("test signer addresses not configured; skipping test")
+	}
+
 	ctx := context.Background()
 	base, endpoints, _, err := createServers(ctx)
 	require.NoError(t, err)
@@ -126,7 +141,7 @@ func TestEndToEnd(t *testing.T) {
 }
 
 func createServers(ctx context.Context) (string, []*core.Endpoint, []*grpcapi.Service, error) {
-	base, err := ioutil.TempDir("", "")
+	base, err := os.MkdirTemp("", "")
 	if err != nil {
 		return "", nil, nil, err
 	}
@@ -192,7 +207,7 @@ func createServer(ctx context.Context, name string, id uint64, port uint32, base
 	if err != nil {
 		return nil, err
 	}
-	checker, err := mockchecker.New()
+	checker, err := mockchecker.New(zerolog.Disabled)
 	if err != nil {
 		return nil, err
 	}
@@ -280,15 +295,15 @@ func createServer(ctx context.Context, name string, id uint64, port uint32, base
 	}
 	mock.Processes[id] = process
 
-	certPEMBlock, err := ioutil.ReadFile(filepath.Join(base, fmt.Sprintf("%s.crt", name)))
+	certPEMBlock, err := os.ReadFile(filepath.Join(base, fmt.Sprintf("%s.crt", name)))
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to obtain server certificate")
 	}
-	keyPEMBlock, err := ioutil.ReadFile(filepath.Join(base, fmt.Sprintf("%s.key", name)))
+	keyPEMBlock, err := os.ReadFile(filepath.Join(base, fmt.Sprintf("%s.key", name)))
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to obtain server key")
 	}
-	caPEMBlock, err := ioutil.ReadFile(filepath.Join(base, "ca.crt"))
+	caPEMBlock, err := os.ReadFile(filepath.Join(base, "ca.crt"))
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to obtain CA certificate")
 	}
@@ -316,15 +331,15 @@ func createServer(ctx context.Context, name string, id uint64, port uint32, base
 }
 
 func createSender(ctx context.Context, name string, base string) (sender.Service, error) {
-	certPEMBlock, err := ioutil.ReadFile(filepath.Join(base, fmt.Sprintf("%s.crt", name)))
+	certPEMBlock, err := os.ReadFile(filepath.Join(base, fmt.Sprintf("%s.crt", name)))
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to obtain server certificate")
 	}
-	keyPEMBlock, err := ioutil.ReadFile(filepath.Join(base, fmt.Sprintf("%s.key", name)))
+	keyPEMBlock, err := os.ReadFile(filepath.Join(base, fmt.Sprintf("%s.key", name)))
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to obtain server key")
 	}
-	caPEMBlock, err := ioutil.ReadFile(filepath.Join(base, "ca.crt"))
+	caPEMBlock, err := os.ReadFile(filepath.Join(base, "ca.crt"))
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to obtain CA certificate")
 	}

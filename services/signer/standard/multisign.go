@@ -1,4 +1,4 @@
-// Copyright © 2021 Attestant Limited.
+// Copyright © 2021, 2022 Attestant Limited.
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,6 +15,7 @@ package standard
 
 import (
 	context "context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -23,7 +24,11 @@ import (
 	"github.com/attestantio/dirk/services/checker"
 	"github.com/attestantio/dirk/services/ruler"
 	"github.com/attestantio/dirk/util"
+	"github.com/pkg/errors"
 	e2wtypes "github.com/wealdtech/go-eth2-wallet-types/v2"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 // Multisign signs multiple generic data.
@@ -35,10 +40,13 @@ func (s *Service) Multisign(ctx context.Context,
 	[]core.Result,
 	[][]byte,
 ) {
+	ctx, span := otel.Tracer("attestantio.dirk.services.signer.standard").Start(ctx, "Multisign")
+	defer span.End()
 	started := time.Now()
 
 	if len(data) == 0 {
 		log.Warn().Str("result", "denied").Msg("Request empty")
+		span.SetStatus(codes.Error, "Request empty")
 		s.monitor.SignCompleted(started, "generic", core.ResultDenied)
 		results := make([]core.Result, 1)
 		results[0] = core.ResultDenied
@@ -57,6 +65,7 @@ func (s *Service) Multisign(ctx context.Context,
 		}
 		return results, nil
 	}
+	span.SetAttributes(attribute.String("client", credentials.Client))
 
 	log := log.With().
 		Str("request_id", credentials.RequestID).
@@ -68,23 +77,24 @@ func (s *Service) Multisign(ctx context.Context,
 
 	// Check input.
 	for i := range data {
-		if data[i] == nil {
-			log.Warn().Str("result", "denied").Msg("Request empty")
+		if err := checkSignData(data[i]); err != nil {
+			log.Warn().Err(err).Str("result", "denied").Msg("Check failed")
 			s.monitor.SignCompleted(started, "generic", core.ResultDenied)
 			results[i] = core.ResultDenied
 			return results, nil
 		}
-		if data[i].Data == nil {
-			log.Warn().Str("result", "denied").Msg("Request missing data")
-			s.monitor.SignCompleted(started, "generic", core.ResultDenied)
-			results[i] = core.ResultDenied
-			return results, nil
-		}
-		if data[i].Domain == nil {
-			log.Warn().Str("result", "denied").Msg("Request missing domain")
-			s.monitor.SignCompleted(started, "generic", core.ResultDenied)
-			results[i] = core.ResultDenied
-			return results, nil
+
+		if e := log.Trace(); e.Enabled() {
+			e.Int("position", i).
+				Str("domain", fmt.Sprintf("%#x", data[i].Domain)).
+				Str("data", fmt.Sprintf("%#x", data[i].Data))
+			if len(accountNames) > i && len(accountNames[i]) > 0 {
+				e.Str("account", accountNames[i])
+			}
+			if len(pubKeys) > i && len(pubKeys[i]) > 0 {
+				e.Str("pubkey", fmt.Sprintf("%#x", pubKeys[i]))
+			}
+			e.Msg("Data to sign")
 		}
 	}
 
@@ -93,6 +103,7 @@ func (s *Service) Multisign(ctx context.Context,
 	if len(accountNames) > entries {
 		entries = len(accountNames)
 	}
+	span.SetAttributes(attribute.Int("requests", entries))
 	rulesData := make([]*ruler.RulesData, entries)
 	accounts := make([]e2wtypes.Account, entries)
 	_, err := util.Scatter(entries, func(offset int, entries int, _ *sync.RWMutex) (interface{}, error) {
@@ -157,6 +168,8 @@ func (s *Service) Multisign(ctx context.Context,
 				s.monitor.SignCompleted(started, "generic", core.ResultFailed)
 				results[i] = core.ResultFailed
 				continue
+			case rules.APPROVED:
+				// Nothing to do.
 			}
 
 			signingRoot, err := generateSigningRoot(ctx, data[i].Data, data[i].Domain)
@@ -189,4 +202,17 @@ func (s *Service) Multisign(ctx context.Context,
 	log.Trace().Dur("elapsed", time.Since(started)).Msg("Completed signing")
 
 	return results, signatures
+}
+
+func checkSignData(data *rules.SignData) error {
+	if data == nil {
+		return errors.New("request empty")
+	}
+	if data.Data == nil {
+		return errors.New("request missing data")
+	}
+	if data.Domain == nil {
+		return errors.New("request missing domain")
+	}
+	return nil
 }
