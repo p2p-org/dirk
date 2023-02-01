@@ -180,39 +180,44 @@ func (s *Service) generateDistributed(ctx context.Context, credentials *checker.
 	confirmationSigs := make([][]byte, len(participants))
 
 	type result struct {
-		PubKey          []byte
-		ConfirmationSig []byte
-		Err             error
+		PubKey           []byte
+		ConfirmationSig  []byte
+		Err              error
+		ParticipantIndex int
 	}
 
 	ch := make(chan result)
 	var wg sync.WaitGroup
 	results := make([]result, len(participants))
 
-	for _, participant := range participants {
+	for i, participant := range participants {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			log.Trace().Str("endpoint", participant.String()).Msg("Sending commit request to endpoint")
 			pubKey, confirmationSig, err := s.senderSvc.Commit(ctx, participant, account, confirmationData)
-			ch <- result{PubKey: pubKey, ConfirmationSig: confirmationSig, Err: err}
+			ch <- result{PubKey: pubKey, ConfirmationSig: confirmationSig, Err: err, ParticipantIndex: i}
 		}()
 	}
 
-	wg.Wait()
+	go func() {
+		wg.Wait()
+		close(ch)
+	}()
 
-	for i, result := range results {
-		pubKeys[i], confirmationSigs[i], err = result.PubKey, result.ConfirmationSig, result.Err
+	for _, result := range results {
+		participantIndex := result.ParticipantIndex
+		pubKeys[participantIndex], confirmationSigs[participantIndex], err = result.PubKey, result.ConfirmationSig, result.Err
 		if err != nil {
-			log.Error().Err(err).Str("endpoint", participants[i].String()).Msg("Failed to commit on endpoint")
+			log.Error().Err(err).Str("endpoint", participants[participantIndex].String()).Msg("Failed to commit on endpoint")
 			return nil, nil, errors.Wrap(err, "failed to complete generation")
 		}
 		if len(result.PubKey) == 0 {
-			log.Error().Uint64("participant", participants[i].ID).Msg("Received empty public key from participant on commit")
+			log.Error().Uint64("participant", participants[participantIndex].ID).Msg("Received empty public key from participant on commit")
 			return nil, nil, errors.New("failed to complete generation")
 		}
 		if len(result.ConfirmationSig) == 0 {
-			log.Error().Uint64("participant", participants[i].ID).Msg("Received empty confirmation signature from participant on commit")
+			log.Error().Uint64("participant", participants[participantIndex].ID).Msg("Received empty confirmation signature from participant on commit")
 			return nil, nil, errors.New("failed to complete generation")
 		}
 	}
