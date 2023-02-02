@@ -200,10 +200,8 @@ func (s *Service) generateDistributed(ctx context.Context, credentials *checker.
 		}()
 	}
 
-	go func() {
-		wg.Wait()
-		close(ch)
-	}()
+	wg.Wait()
+	close(ch)
 
 	for _, result := range results {
 		participantIndex := result.ParticipantIndex
