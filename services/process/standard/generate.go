@@ -192,12 +192,12 @@ func (s *Service) generateDistributed(ctx context.Context, credentials *checker.
 
 	for i, participant := range participants {
 		wg.Add(1)
-		go func() {
+		go func(i int, participant *core.Endpoint) {
 			defer wg.Done()
 			log.Trace().Str("endpoint", participant.String()).Msg("Sending commit request to endpoint")
 			pubKey, confirmationSig, err := s.senderSvc.Commit(ctx, participant, account, confirmationData)
 			ch <- result{PubKey: pubKey, ConfirmationSig: confirmationSig, Err: err, ParticipantIndex: i}
-		}()
+		}(i, participant)
 	}
 
 	wg.Wait()
