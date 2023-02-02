@@ -186,9 +186,8 @@ func (s *Service) generateDistributed(ctx context.Context, credentials *checker.
 		ParticipantIndex int
 	}
 
-	ch := make(chan result)
+	ch := make(chan result, len(participants))
 	var wg sync.WaitGroup
-	results := make([]result, len(participants))
 
 	for i, participant := range participants {
 		wg.Add(1)
@@ -203,7 +202,7 @@ func (s *Service) generateDistributed(ctx context.Context, credentials *checker.
 	wg.Wait()
 	close(ch)
 
-	for _, result := range results {
+	for result := range ch {
 		participantIndex := result.ParticipantIndex
 		pubKeys[participantIndex], confirmationSigs[participantIndex], err = result.PubKey, result.ConfirmationSig, result.Err
 		if err != nil {
