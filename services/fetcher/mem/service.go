@@ -141,7 +141,7 @@ func (s *Service) repopulateCache(
 			}
 
 		case <-ctx.Done():
-			break
+			return
 		}
 	}
 }
